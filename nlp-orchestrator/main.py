@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -28,7 +28,7 @@ from cache import (
 from config import FRONTEND_ORIGIN, GROQ_API_KEY, GROQ_MODEL_FAST, GEMINI_API_KEY, GEMINI_MODEL
 from decomposer import decompose_query
 from router import route_questions
-from research import run_parallel_research
+from research import run_parallel_research, stream_groq_chat
 from synthesizer import synthesize_answers
 from validators.citation_validator import validate_citations_from_text
 from avatar_speech import get_interim_messages, convert_to_hinglish, detect_domain
@@ -461,21 +461,28 @@ async def deep_research_pipeline(query: str, language: str):
         if model_choice == "groq" or (
             model_choice == "gemini" and not gemini_client
         ):
+            messages = [
+                {"role": "system", "content": grounded_prompt},
+                {"role": "user", "content": query}
+            ]
 
-            response = await groq_client.chat.completions.create(
+            # Stream reasoning tokens from Groq as they arrive
+            answer_parts = []
+            async for token in stream_groq_chat(
+                messages,
                 model=GROQ_MODEL_FAST,
-                messages=[
-                    {"role": "system", "content": grounded_prompt},
-                    {"role": "user", "content": query}
-                ],
                 temperature=0.2,
                 max_tokens=2048
-            )
+            ):
+                if not token:
+                    continue
+                answer_parts.append(token)
+                yield sse_event("reasoning", {"text": token})
 
-            ai_answer = response.choices[0].message.content.strip()
+            ai_answer = "".join(answer_parts).strip()
 
-        # Stream reasoning text in chunks for live display
-        if ai_answer:
+        # If the model returned a non-streamed Gemini answer, emit it in smaller chunks
+        elif ai_answer:
             words = ai_answer.split()
             chunk_size = 8
             for i in range(0, len(words), chunk_size):
@@ -570,6 +577,28 @@ async def deep_research(body: LegalQuery, request: Request):
             yield {"data": event}
 
     return EventSourceResponse(event_generator())
+
+
+@app.get("/research/deep")
+async def deep_research_stream(request: Request, query: str, language: str = "en"):
+    """GET SSE endpoint for streaming deep research over EventSource."""
+    if not query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    if len(query) > 2000:
+        raise HTTPException(status_code=400, detail="Query exceeds maximum length of 2000 characters")
+
+    async def event_generator():
+        pipeline = deep_research_pipeline(query, language)
+        async for event in pipeline:
+            if request and await request.is_disconnected():
+                logger.info("[Deep Research Stream] Client disconnected")
+                break
+            yield f"data: {event}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream"
+    )
 
 
 # ─── Run ──────────────────────────────────────────────────────────────────────

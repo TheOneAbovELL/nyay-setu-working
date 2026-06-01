@@ -313,59 +313,37 @@ export default function VakilFriendChat() {
     };
 
     // Deep Research SSE Connection
-    const startDeepResearch = async (query) => {
-        // Abort any previous deep research
+    const startDeepResearch = (query) => {
+        // Close any previous deep research stream
         if (deepResearchAbortRef.current) {
-            deepResearchAbortRef.current.abort();
+            deepResearchAbortRef.current.close();
         }
 
-        const abortController = new AbortController();
-        deepResearchAbortRef.current = abortController;
-
-        // Reset state
         setIsDeepResearching(true);
         setReasoningStages({});
         setReasoningText('');
         setKanoonResults([]);
 
-        try {
-            const response = await fetch('http://localhost:8001/research/deep', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query, language }),
-                signal: abortController.signal
-            });
+        const streamUrl = `http://localhost:8001/research/deep?query=${encodeURIComponent(query)}&language=${encodeURIComponent(language)}`;
+        const eventSource = new EventSource(streamUrl);
+        deepResearchAbortRef.current = eventSource;
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop(); // Keep incomplete line in buffer
-
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.slice(6));
-                            handleDeepResearchEvent(data);
-                        } catch (e) {
-                            // Ignore JSON parse errors for partial data
-                        }
-                    }
-                }
+        eventSource.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                handleDeepResearchEvent(data);
+            } catch (e) {
+                // Ignore parse errors for partial or unexpected stream payloads
             }
-        } catch (err) {
-            if (err.name !== 'AbortError') {
-                console.error('Deep research error:', err);
+        };
+
+        eventSource.onerror = (err) => {
+            console.error('Deep research SSE error:', err);
+            if (eventSource.readyState === EventSource.CLOSED) {
+                setIsDeepResearching(false);
             }
-        } finally {
-            setIsDeepResearching(false);
-        }
+            eventSource.close();
+        };
     };
 
     const handleDeepResearchEvent = (data) => {
@@ -411,7 +389,11 @@ export default function VakilFriendChat() {
                 break;
 
             case 'done':
-                // Research complete — stages will show all green
+                if (deepResearchAbortRef.current) {
+                    deepResearchAbortRef.current.close();
+                    deepResearchAbortRef.current = null;
+                }
+                setIsDeepResearching(false);
                 break;
 
             default:
